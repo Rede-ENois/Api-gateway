@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"flag"
 	"log"
@@ -18,13 +19,12 @@ func main() {
 	configPath := flag.String("config", "gateway.yaml", "path to the gateway YAML configuration")
 	flag.Parse()
 
-	file, err := os.Open(*configPath)
+	raw, err := os.ReadFile(*configPath)
 	if err != nil {
-		log.Fatalf("open configuration: %v", err)
+		log.Fatalf("read configuration: %v", err)
 	}
-	defer file.Close()
 	var cfg gateway.Config
-	decoder := yaml.NewDecoder(file)
+	decoder := yaml.NewDecoder(bytes.NewReader(raw))
 	decoder.KnownFields(true)
 	if err := decoder.Decode(&cfg); err != nil {
 		log.Fatalf("decode configuration: %v", err)

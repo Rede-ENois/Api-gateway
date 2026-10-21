@@ -89,7 +89,7 @@ func TestPatterns(t *testing.T) {
 	for _, tc := range []struct {
 		pattern, path string
 		want          bool
-	}{{"/v1/*", "/v1/a", true}, {"/v1/*", "/v1/a/b", false}, {"/users/**", "/users/a/b", true}, {"/users/**", "/users/123", true}, {"re:^/models/[0-9]+$", "/models/42", true}, {"/models/{id}", "/models/a", true}, {"/models/{id}", "/models/a/v", false}} {
+	}{{"/v1/*", "/v1/a", true}, {"/v1/*", "/v1/a/b", false}, {"/users/**", "/users/a/b", true}, {"/users/**", "/users/123", true}, {"re:^/models/[0-9]+$", "/models/42", true}, {"/models/{id}", "/models/a", true}, {"/models/{id}", "/models/a/v", false}, {"/models/{model_id-2}", "/models/a", true}, {"/models/{1x}", "/models/{1x}", true}, {"/models/{1x}", "/models/a", false}} {
 		m, err := compileMatcher(tc.pattern, nil)
 		if err != nil {
 			t.Fatal(err)

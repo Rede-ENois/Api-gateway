@@ -69,7 +69,7 @@ func compilePathPattern(pattern string) string {
 			end := strings.IndexByte(pattern[i:], '}')
 			if end > 1 {
 				name := pattern[i+1 : i+end]
-				if validParameterName(name) {
+				if parameterName.MatchString(name) {
 					b.WriteString("[^/]+")
 					i += end + 1
 					continue
@@ -86,17 +86,7 @@ func compilePathPattern(pattern string) string {
 	return b.String()
 }
 
-func validParameterName(name string) bool {
-	if name == "" || !((name[0] >= 'a' && name[0] <= 'z') || (name[0] >= 'A' && name[0] <= 'Z')) {
-		return false
-	}
-	for _, c := range name[1:] {
-		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-') {
-			return false
-		}
-	}
-	return true
-}
+var parameterName = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]*$`)
 
 // routeSpecificity scores each segment so literals beat parameters, parameters
 // beat one-segment wildcards and those beat recursive wildcards. Regex routes
