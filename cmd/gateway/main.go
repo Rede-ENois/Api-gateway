@@ -30,6 +30,9 @@ func main() {
 		log.Fatalf("decode configuration: %v", err)
 	}
 
+	if cfg.Listen == "" {
+		cfg.Listen = ":8080"
+	}
 	g, err := gateway.New(cfg)
 	if err != nil {
 		log.Fatalf("create gateway: %v", err)

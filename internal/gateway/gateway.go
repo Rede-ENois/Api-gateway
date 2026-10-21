@@ -35,9 +35,6 @@ const WriteTimeout = 60 * time.Second
 const defaultRouteTimeout = 30 * time.Second
 
 func New(c Config) (*Gateway, error) {
-	if c.Listen == "" {
-		c.Listen = ":8080"
-	}
 	if c.Workers <= 0 {
 		c.Workers = 64
 	}
