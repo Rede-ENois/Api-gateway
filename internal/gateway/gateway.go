@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -26,6 +27,10 @@ type Gateway struct {
 	maxBody        int64
 	transport      *http.Transport
 	trustedProxies []netip.Prefix
+	// overloadRejections counts 503s since the last overload log line, written
+	// at most once per overloadLogInterval (unix nanos in lastOverloadLog).
+	overloadRejections atomic.Int64
+	lastOverloadLog    atomic.Int64
 }
 
 // WriteTimeout is the server write timeout. Route timeouts must stay below it,
@@ -33,6 +38,8 @@ type Gateway struct {
 const WriteTimeout = 60 * time.Second
 
 const defaultRouteTimeout = 30 * time.Second
+
+const overloadLogInterval = time.Second
 
 func New(c Config) (*Gateway, error) {
 	if c.Workers <= 0 {
@@ -147,6 +154,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case g.admitted <- struct{}{}:
 		defer func() { <-g.admitted }()
 	default:
+		g.logOverload(time.Now())
 		w.Header().Set("Retry-After", "1")
 		http.Error(w, "gateway overloaded", http.StatusServiceUnavailable)
 		return
@@ -243,6 +251,17 @@ func (g gatekeeper) release() {
 	if g.sem != nil {
 		<-g.sem
 	}
+}
+
+// logOverload records a 503 and logs the rejections accumulated since the last
+// line, so a sustained overload yields one line per interval, not one per request.
+func (g *Gateway) logOverload(now time.Time) {
+	g.overloadRejections.Add(1)
+	last := g.lastOverloadLog.Load()
+	if now.UnixNano()-last < int64(overloadLogInterval) || !g.lastOverloadLog.CompareAndSwap(last, now.UnixNano()) {
+		return
+	}
+	slog.Warn("gateway overloaded, requests rejected", "rejected", g.overloadRejections.Swap(0), "interval", overloadLogInterval)
 }
 
 func (g *Gateway) newProxy(target *url.URL, routeName string) *httputil.ReverseProxy {

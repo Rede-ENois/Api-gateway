@@ -40,7 +40,8 @@ offenders without trusting spoofed headers.
 
 `workers` caps concurrent upstream calls and `queue_size` caps how many more
 requests may wait for a worker. A request arriving with both full is rejected
-with `503`; a request whose client disconnects while waiting is dropped. Rate
+with `503` and counted in a warning logged at most once per second; a request
+whose client disconnects while waiting is dropped. Rate
 limits and the per-route concurrency cap answer `429` (with `Retry-After` for
 rate limits).
 

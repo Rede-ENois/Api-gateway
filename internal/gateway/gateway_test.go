@@ -1,7 +1,9 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -244,5 +246,22 @@ func TestClientIP(t *testing.T) {
 		if got := g.clientIP(r); got != tc.want {
 			t.Errorf("%s: got %q, want %q", tc.name, got, tc.want)
 		}
+	}
+}
+
+func TestOverloadLogIsSampled(t *testing.T) {
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	g := newTestGateway(t, Config{})
+	start := time.Unix(1000, 0)
+	for _, at := range []time.Time{start, start, start.Add(time.Millisecond), start.Add(overloadLogInterval)} {
+		g.logOverload(at)
+	}
+	lines := strings.Split(strings.TrimSpace(logs.String()), "\n")
+	if len(lines) != 2 || !strings.Contains(lines[0], "rejected=1") || !strings.Contains(lines[1], "rejected=3") {
+		t.Fatalf("want one line per interval carrying the rejection count, got:\n%s", logs.String())
 	}
 }
