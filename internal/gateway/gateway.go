@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
@@ -20,10 +21,11 @@ type Gateway struct {
 	rateLimits []runtimeRateLimit
 	// admitted bounds requests running or waiting for a worker (workers +
 	// queue_size); running bounds concurrent upstream calls (workers).
-	admitted  chan struct{}
-	running   chan struct{}
-	maxBody   int64
-	transport *http.Transport
+	admitted       chan struct{}
+	running        chan struct{}
+	maxBody        int64
+	transport      *http.Transport
+	trustedProxies []netip.Prefix
 }
 
 // WriteTimeout is the server write timeout. Route timeouts must stay below it,
@@ -46,6 +48,14 @@ func New(c Config) (*Gateway, error) {
 		c.MaxBodyBytes = 10 << 20
 	}
 	g := &Gateway{admitted: make(chan struct{}, c.Workers+c.QueueSize), running: make(chan struct{}, c.Workers), maxBody: c.MaxBodyBytes, transport: &http.Transport{MaxIdleConns: 256, MaxIdleConnsPerHost: 64, IdleConnTimeout: 90 * time.Second, TLSHandshakeTimeout: 5 * time.Second, ExpectContinueTimeout: 1 * time.Second}}
+	for _, cidr := range c.TrustedProxies {
+		prefix, err := netip.ParsePrefix(cidr)
+		if err != nil {
+			g.Close()
+			return nil, fmt.Errorf("trusted proxy %q must be a CIDR such as 10.0.0.0/8: %w", cidr, err)
+		}
+		g.trustedProxies = append(g.trustedProxies, prefix.Masked())
+	}
 	for _, rc := range c.Routes {
 		r, err := compileRoute(rc)
 		if err != nil {
@@ -64,6 +74,9 @@ func New(c Config) (*Gateway, error) {
 		if timeout >= WriteTimeout {
 			g.Close()
 			return nil, fmt.Errorf("route %q: timeout must be below the server write timeout (%s)", r.config.Name, WriteTimeout)
+		}
+		if len(rc.Gatekeeper.APIKeys) == 0 {
+			slog.Warn("route has no api_keys and is public", "route", r.config.Name)
 		}
 		g.routes = append(g.routes, runtimeRoute{route: r, gate: newGatekeeper(rc.Gatekeeper), timeout: timeout, proxy: g.newProxy(target, r.config.Name)})
 	}
@@ -114,7 +127,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if policy, found := g.lookupRateLimit(r.URL.Path, r.Method); found {
-		allowed, retry := policy.limiter.Allow(limitKey(policy.config.Key, route.gate.header, r), time.Now())
+		allowed, retry := policy.limiter.Allow(limitKey(policy.config.Key, g.clientIP(r), r.Header.Get(route.gate.header)), time.Now())
 		if !allowed {
 			seconds := int(retry.Seconds())
 			if retry%time.Second != 0 {
@@ -189,11 +202,10 @@ func (g *Gateway) lookupRateLimit(path, method string) (runtimeRateLimit, bool) 
 	return best, found
 }
 
-// Gatekeeper checks the API key and scope before scarce worker capacity is used.
+// Gatekeeper checks the API key before scarce worker capacity is used.
 type gatekeeper struct {
 	keys   map[string]struct{}
 	header string
-	scopes map[string]struct{}
 	sem    chan struct{}
 }
 
@@ -206,34 +218,18 @@ func newGatekeeper(c GatekeeperConfig) gatekeeper {
 	if header == "" {
 		header = "X-API-Key"
 	}
-	scopes := map[string]struct{}{}
-	for _, s := range c.RequiredScopes {
-		scopes[s] = struct{}{}
-	}
 	var sem chan struct{}
 	if c.MaxConcurrentCalls > 0 {
 		sem = make(chan struct{}, c.MaxConcurrentCalls)
 	}
-	return gatekeeper{keys: keys, header: header, scopes: scopes, sem: sem}
+	return gatekeeper{keys: keys, header: header, sem: sem}
 }
 func (g gatekeeper) authorized(r *http.Request) bool {
-	if len(g.keys) > 0 {
-		if _, ok := g.keys[r.Header.Get(g.header)]; !ok {
-			return false
-		}
+	if len(g.keys) == 0 {
+		return true
 	}
-	if len(g.scopes) > 0 {
-		have := map[string]struct{}{}
-		for _, s := range strings.Fields(r.Header.Get("X-Scopes")) {
-			have[s] = struct{}{}
-		}
-		for s := range g.scopes {
-			if _, ok := have[s]; !ok {
-				return false
-			}
-		}
-	}
-	return true
+	_, ok := g.keys[r.Header.Get(g.header)]
+	return ok
 }
 func (g gatekeeper) acquire() bool {
 	if g.sem == nil {
@@ -258,7 +254,7 @@ func (g *Gateway) newProxy(target *url.URL, routeName string) *httputil.ReverseP
 		// ReverseProxy has already stripped hop-by-hop and X-Forwarded-* headers.
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.SetURL(target)
-			ip := clientIP(pr.In)
+			ip := g.clientIP(pr.In)
 			pr.Out.Header.Set("X-Forwarded-For", ip)
 			pr.Out.Header.Set("X-Forwarded-Proto", requestScheme(pr.In))
 			// Trusted metadata lets the moderation model associate a verdict with the
@@ -283,12 +279,43 @@ func (g *Gateway) newProxy(target *url.URL, routeName string) *httputil.ReverseP
 	}
 }
 
-func clientIP(r *http.Request) string {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err == nil {
-		return host
+// clientIP returns the peer address or, when the peer is a trusted proxy, the
+// rightmost X-Forwarded-For hop that is not a trusted proxy. Hops to the left
+// of it were written by the client and cannot be trusted.
+func (g *Gateway) clientIP(r *http.Request) string {
+	ip := r.RemoteAddr
+	if host, _, err := net.SplitHostPort(ip); err == nil {
+		ip = host
 	}
-	return r.RemoteAddr
+	if !g.isTrustedProxy(ip) {
+		return ip
+	}
+	hops := strings.Split(strings.Join(r.Header.Values("X-Forwarded-For"), ","), ",")
+	for i := len(hops) - 1; i >= 0; i-- {
+		hop := strings.TrimSpace(hops[i])
+		if g.isTrustedProxy(hop) {
+			continue
+		}
+		if _, err := netip.ParseAddr(hop); err != nil {
+			return ip
+		}
+		return hop
+	}
+	return ip
+}
+
+func (g *Gateway) isTrustedProxy(ip string) bool {
+	addr, err := netip.ParseAddr(ip)
+	if err != nil {
+		return false
+	}
+	addr = addr.Unmap()
+	for _, prefix := range g.trustedProxies {
+		if prefix.Contains(addr) {
+			return true
+		}
+	}
+	return false
 }
 func requestScheme(r *http.Request) string {
 	if r.TLS != nil {
@@ -296,8 +323,7 @@ func requestScheme(r *http.Request) string {
 	}
 	return "http"
 }
-func limitKey(kind, credentialHeader string, r *http.Request) string {
-	ip, key := clientIP(r), r.Header.Get(credentialHeader)
+func limitKey(kind, ip, key string) string {
 	switch kind {
 	case "ip":
 		return ip

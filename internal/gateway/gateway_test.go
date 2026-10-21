@@ -51,7 +51,7 @@ func TestGatewayAppliesRouteAuthAndRateLimit(t *testing.T) {
 	})
 	g := newTestGateway(t, Config{Workers: 2, QueueSize: 2, RateLimits: []RateLimitConfig{{Route: "/v1/models/**", Pattern: "fixed_window", Limit: 1, Window: Duration{Duration: time.Minute}, Key: "api_key"}}, Routes: []RouteConfig{{
 		Name: "prediction", Pattern: "/v1/models/{model}/predict", Methods: []string{"POST"}, Upstream: upstream,
-		Gatekeeper: GatekeeperConfig{Header: "X-Client-Token", APIKeys: []string{"demo-key"}, RequiredScopes: []string{"predict"}},
+		Gatekeeper: GatekeeperConfig{Header: "X-Client-Token", APIKeys: []string{"demo-key"}},
 	}}})
 
 	bad := httptest.NewRequest(http.MethodPost, "/v1/models/cat/predict", nil)
@@ -63,7 +63,6 @@ func TestGatewayAppliesRouteAuthAndRateLimit(t *testing.T) {
 	request := func() *http.Request {
 		r := httptest.NewRequest(http.MethodPost, "/v1/models/cat/predict", nil)
 		r.Header.Set("X-Client-Token", "demo-key")
-		r.Header.Set("X-Scopes", "predict")
 		r.Header.Set("X-Gateway-Client-IP", "spoofed")
 		return r
 	}
@@ -137,6 +136,7 @@ func TestNewRejectsInvalidConfig(t *testing.T) {
 		"rate limit without route":   {RateLimits: []RateLimitConfig{{Limit: 1}}},
 		"relative upstream":          {Routes: []RouteConfig{{Pattern: "/x", Upstream: "/relative"}}},
 		"timeout over write timeout": {Routes: route(WriteTimeout)},
+		"trusted proxy without mask": {TrustedProxies: []string{"10.0.0.1"}},
 	} {
 		if _, err := New(c); err == nil {
 			t.Errorf("%s: expected an error", name)
@@ -221,6 +221,28 @@ func TestUpstreamErrorsMapToStatus(t *testing.T) {
 	} {
 		if got := serve(g, tc.request).Code; got != tc.want {
 			t.Errorf("%s: got %d, want %d", tc.request.URL.Path, got, tc.want)
+		}
+	}
+}
+
+func TestClientIP(t *testing.T) {
+	g := newTestGateway(t, Config{TrustedProxies: []string{"10.0.0.0/8"}})
+	for _, tc := range []struct {
+		name, remote, forwardedFor, want string
+	}{
+		{"untrusted peer ignores X-Forwarded-For", "203.0.113.9:1234", "198.51.100.1", "203.0.113.9"},
+		{"trusted peer uses the forwarded client", "10.0.0.2:1234", "198.51.100.1", "198.51.100.1"},
+		{"spoofed left hops are skipped", "10.0.0.2:1234", "1.2.3.4, 198.51.100.1, 10.0.0.3", "198.51.100.1"},
+		{"trusted peer without header falls back to the peer", "10.0.0.2:1234", "", "10.0.0.2"},
+		{"garbage hop falls back to the peer", "10.0.0.2:1234", "not-an-ip", "10.0.0.2"},
+	} {
+		r := httptest.NewRequest(http.MethodGet, "/", nil)
+		r.RemoteAddr = tc.remote
+		if tc.forwardedFor != "" {
+			r.Header.Set("X-Forwarded-For", tc.forwardedFor)
+		}
+		if got := g.clientIP(r); got != tc.want {
+			t.Errorf("%s: got %q, want %q", tc.name, got, tc.want)
 		}
 	}
 }

@@ -9,7 +9,6 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags='-s -w' -o /out/gateway
 FROM scratch
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=build /out/gateway /gateway
-COPY gateway.example.yaml /etc/enois/gateway.yaml
 USER 65532:65532
 EXPOSE 8080
 ENTRYPOINT ["/gateway"]

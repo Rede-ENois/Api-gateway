@@ -9,12 +9,15 @@ import (
 
 // Config defines the process-level limits and the routes the gateway serves.
 type Config struct {
-	Listen       string            `json:"listen" yaml:"listen"`
-	Workers      int               `json:"workers" yaml:"workers"`
-	QueueSize    int               `json:"queue_size" yaml:"queue_size"`
-	MaxBodyBytes int64             `json:"max_body_bytes" yaml:"max_body_bytes"`
-	Routes       []RouteConfig     `json:"routes" yaml:"routes"`
-	RateLimits   []RateLimitConfig `json:"rate_limit" yaml:"rate_limit"`
+	Listen       string `json:"listen" yaml:"listen"`
+	Workers      int    `json:"workers" yaml:"workers"`
+	QueueSize    int    `json:"queue_size" yaml:"queue_size"`
+	MaxBodyBytes int64  `json:"max_body_bytes" yaml:"max_body_bytes"`
+	// TrustedProxies lists the CIDRs of reverse proxies in front of the gateway.
+	// Only requests from them have X-Forwarded-For honored for the client IP.
+	TrustedProxies []string          `json:"trusted_proxies" yaml:"trusted_proxies"`
+	Routes         []RouteConfig     `json:"routes" yaml:"routes"`
+	RateLimits     []RateLimitConfig `json:"rate_limit" yaml:"rate_limit"`
 }
 
 type RouteConfig struct {
@@ -29,7 +32,6 @@ type RouteConfig struct {
 type GatekeeperConfig struct {
 	APIKeys            []string `json:"api_keys" yaml:"api_keys"`
 	Header             string   `json:"header" yaml:"header"`
-	RequiredScopes     []string `json:"required_scopes" yaml:"required_scopes"`
 	MaxConcurrentCalls int      `json:"max_concurrent_calls" yaml:"max_concurrent_calls"`
 }
 
