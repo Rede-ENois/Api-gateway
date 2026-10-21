@@ -6,11 +6,16 @@ import (
 	"strings"
 )
 
-type route struct {
-	config      RouteConfig
+// matcher is the compiled path pattern shared by proxy routes and rate limit rules.
+type matcher struct {
 	re          *regexp.Regexp
 	methods     map[string]bool
 	specificity int
+}
+
+type route struct {
+	matcher
+	config RouteConfig
 }
 
 func compileRoute(c RouteConfig) (route, error) {
@@ -20,7 +25,15 @@ func compileRoute(c RouteConfig) (route, error) {
 	if c.Pattern == "" || c.Upstream == "" {
 		return route{}, fmt.Errorf("route %q needs pattern and upstream", c.Name)
 	}
-	p := c.Pattern
+	m, err := compileMatcher(c.Pattern, c.Methods)
+	if err != nil {
+		return route{}, fmt.Errorf("route %q: %w", c.Name, err)
+	}
+	return route{matcher: m, config: c}, nil
+}
+
+func compileMatcher(pattern string, methods []string) (matcher, error) {
+	p := pattern
 	if strings.HasPrefix(p, "re:") {
 		p = strings.TrimPrefix(p, "re:")
 	} else {
@@ -28,13 +41,13 @@ func compileRoute(c RouteConfig) (route, error) {
 	}
 	re, err := regexp.Compile(p)
 	if err != nil {
-		return route{}, fmt.Errorf("route %q: invalid pattern: %w", c.Name, err)
+		return matcher{}, fmt.Errorf("invalid pattern: %w", err)
 	}
-	m := make(map[string]bool, len(c.Methods))
-	for _, method := range c.Methods {
+	m := make(map[string]bool, len(methods))
+	for _, method := range methods {
 		m[strings.ToUpper(method)] = true
 	}
-	return route{config: c, re: re, methods: m, specificity: routeSpecificity(c.Pattern)}, nil
+	return matcher{re: re, methods: m, specificity: routeSpecificity(pattern)}, nil
 }
 
 // compilePathPattern recognizes a named segment, a one-segment wildcard and a
@@ -56,7 +69,7 @@ func compilePathPattern(pattern string) string {
 			end := strings.IndexByte(pattern[i:], '}')
 			if end > 1 {
 				name := pattern[i+1 : i+end]
-				if validParameterName(name) {
+				if parameterName.MatchString(name) {
 					b.WriteString("[^/]+")
 					i += end + 1
 					continue
@@ -73,24 +86,29 @@ func compilePathPattern(pattern string) string {
 	return b.String()
 }
 
-func validParameterName(name string) bool {
-	if name == "" || !((name[0] >= 'a' && name[0] <= 'z') || (name[0] >= 'A' && name[0] <= 'Z')) {
-		return false
-	}
-	for _, c := range name[1:] {
-		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-') {
-			return false
-		}
-	}
-	return true
-}
+var parameterName = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]*$`)
 
+// routeSpecificity scores each segment so literals beat parameters, parameters
+// beat one-segment wildcards and those beat recursive wildcards. Regex routes
+// score 0. On a tie the route declared first wins.
 func routeSpecificity(pattern string) int {
 	if strings.HasPrefix(pattern, "re:") {
 		return 0
 	}
-	return len(strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(pattern, "**", ""), "*", ""), "{", ""))
+	score := 0
+	for _, segment := range strings.Split(strings.Trim(pattern, "/"), "/") {
+		switch {
+		case strings.Contains(segment, "**"):
+		case strings.Contains(segment, "*"):
+			score++
+		case strings.Contains(segment, "{"):
+			score += 2
+		default:
+			score += 3
+		}
+	}
+	return score
 }
-func (r route) matches(path, method string) bool {
+func (r matcher) matches(path, method string) bool {
 	return r.re.MatchString(path) && (len(r.methods) == 0 || r.methods[method])
 }

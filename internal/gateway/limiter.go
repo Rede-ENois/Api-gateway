@@ -1,51 +1,65 @@
 package gateway
 
 import (
+	"errors"
+	"fmt"
 	"math"
 	"sync"
 	"time"
 )
 
+// limiter holds the state of one key. Implementations are not safe for
+// concurrent use; keyedLimiter serializes every call under its own mutex.
 type limiter interface {
-	Allow(string, time.Time) (bool, time.Duration)
+	Allow(now time.Time) (bool, time.Duration)
 }
 type limiterEntry struct {
 	l    limiter
 	seen time.Time
 }
 type keyedLimiter struct {
-	make   func() limiter
-	mu     sync.Mutex
-	values map[string]limiterEntry
+	newLimiter func() limiter
+	// idleTTL is how long a key must stay idle before its state equals a fresh
+	// limiter, so dropping it cannot let a client through earlier.
+	idleTTL   time.Duration
+	mu        sync.Mutex
+	entries   map[string]*limiterEntry
+	lastSweep time.Time
 }
 
-func newKeyedLimiter(makeFn func() limiter) *keyedLimiter {
-	return &keyedLimiter{make: makeFn, values: map[string]limiterEntry{}}
+func newKeyedLimiter(newLimiter func() limiter, idleTTL time.Duration) *keyedLimiter {
+	return &keyedLimiter{newLimiter: newLimiter, idleTTL: idleTTL, entries: map[string]*limiterEntry{}}
 }
 func (k *keyedLimiter) Allow(key string, now time.Time) (bool, time.Duration) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
-	e, ok := k.values[key]
-	if !ok {
-		e.l = k.make()
+	// ponytail: O(keys) sweep under the global lock once per idleTTL; shard the
+	// map if key cardinality ever makes that pause visible.
+	if now.Sub(k.lastSweep) >= k.idleTTL {
+		for idleKey, e := range k.entries {
+			if now.Sub(e.seen) >= k.idleTTL {
+				delete(k.entries, idleKey)
+			}
+		}
+		k.lastSweep = now
 	}
-	yes, retry := e.l.Allow(key, now)
+	e, ok := k.entries[key]
+	if !ok {
+		e = &limiterEntry{l: k.newLimiter()}
+		k.entries[key] = e
+	}
 	e.seen = now
-	k.values[key] = e
-	return yes, retry
+	return e.l.Allow(now)
 }
 
 type tokenBucket struct {
-	mu     sync.Mutex
 	tokens float64
 	last   time.Time
 	rate   float64
 	burst  float64
 }
 
-func (t *tokenBucket) Allow(_ string, now time.Time) (bool, time.Duration) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+func (t *tokenBucket) Allow(now time.Time) (bool, time.Duration) {
 	if t.last.IsZero() {
 		t.last = now
 		t.tokens = t.burst
@@ -60,15 +74,12 @@ func (t *tokenBucket) Allow(_ string, now time.Time) (bool, time.Duration) {
 }
 
 type fixedWindow struct {
-	mu           sync.Mutex
 	start        time.Time
 	count, limit int
 	window       time.Duration
 }
 
-func (f *fixedWindow) Allow(_ string, now time.Time) (bool, time.Duration) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
+func (f *fixedWindow) Allow(now time.Time) (bool, time.Duration) {
 	if f.start.IsZero() || now.Sub(f.start) >= f.window {
 		f.start = now
 		f.count = 0
@@ -81,15 +92,12 @@ func (f *fixedWindow) Allow(_ string, now time.Time) (bool, time.Duration) {
 }
 
 type slidingWindow struct {
-	mu     sync.Mutex
 	events []time.Time
 	limit  int
 	window time.Duration
 }
 
-func (s *slidingWindow) Allow(_ string, now time.Time) (bool, time.Duration) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+func (s *slidingWindow) Allow(now time.Time) (bool, time.Duration) {
 	cutoff := now.Add(-s.window)
 	i := 0
 	for i < len(s.events) && s.events[i].Before(cutoff) {
@@ -103,26 +111,29 @@ func (s *slidingWindow) Allow(_ string, now time.Time) (bool, time.Duration) {
 	return true, 0
 }
 
-func makeLimiter(c RateLimitConfig) limiter {
+func makeLimiter(c RateLimitConfig) (*keyedLimiter, error) {
 	window := c.Window.Duration
 	if window <= 0 {
 		window = time.Minute
 	}
 	if c.Limit <= 0 {
-		return nil
+		return nil, errors.New("limit must be positive")
 	}
 	burst := c.Burst
 	if burst <= 0 {
 		burst = c.Limit
 	}
-	var factory func() limiter
 	switch c.Pattern {
 	case "fixed_window":
-		factory = func() limiter { return &fixedWindow{limit: c.Limit, window: window} }
+		return newKeyedLimiter(func() limiter { return &fixedWindow{limit: c.Limit, window: window} }, window), nil
 	case "sliding_window":
-		factory = func() limiter { return &slidingWindow{limit: c.Limit, window: window} }
+		return newKeyedLimiter(func() limiter { return &slidingWindow{limit: c.Limit, window: window} }, window), nil
+	case "", "token_bucket":
+		rate := float64(c.Limit) / window.Seconds()
+		// An empty bucket is full again after burst/rate seconds.
+		refill := time.Duration(float64(burst) / rate * float64(time.Second))
+		return newKeyedLimiter(func() limiter { return &tokenBucket{rate: rate, burst: float64(burst)} }, max(window, refill)), nil
 	default:
-		factory = func() limiter { return &tokenBucket{rate: float64(c.Limit) / window.Seconds(), burst: float64(burst)} }
+		return nil, fmt.Errorf("unknown pattern %q (want token_bucket, fixed_window or sliding_window)", c.Pattern)
 	}
-	return newKeyedLimiter(factory)
 }

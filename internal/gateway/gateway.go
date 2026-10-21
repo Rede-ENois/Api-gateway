@@ -3,13 +3,16 @@ package gateway
 import (
 	"context"
 	"errors"
-	"io"
+	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httputil"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -17,16 +20,28 @@ import (
 type Gateway struct {
 	routes     []runtimeRoute
 	rateLimits []runtimeRateLimit
-	pool       *Pool
-	maxBody    int64
-	clients    *http.Client
-	closed     sync.Once
+	// admitted bounds requests running or waiting for a worker (workers +
+	// queue_size); running bounds concurrent upstream calls (workers).
+	admitted       chan struct{}
+	running        chan struct{}
+	maxBody        int64
+	transport      *http.Transport
+	trustedProxies []netip.Prefix
+	// overloadRejections counts 503s since the last overload log line, written
+	// at most once per overloadLogInterval (unix nanos in lastOverloadLog).
+	overloadRejections atomic.Int64
+	lastOverloadLog    atomic.Int64
 }
 
+// WriteTimeout is the server write timeout. Route timeouts must stay below it,
+// or the server cuts the response before the upstream call times out.
+const WriteTimeout = 60 * time.Second
+
+const defaultRouteTimeout = 30 * time.Second
+
+const overloadLogInterval = time.Second
+
 func New(c Config) (*Gateway, error) {
-	if c.Listen == "" {
-		c.Listen = ":8080"
-	}
 	if c.Workers <= 0 {
 		c.Workers = 64
 	}
@@ -36,41 +51,66 @@ func New(c Config) (*Gateway, error) {
 	if c.MaxBodyBytes <= 0 {
 		c.MaxBodyBytes = 10 << 20
 	}
-	g := &Gateway{pool: NewPool(c.Workers, c.QueueSize), maxBody: c.MaxBodyBytes, clients: &http.Client{Transport: &http.Transport{MaxIdleConns: 256, MaxIdleConnsPerHost: 64, IdleConnTimeout: 90 * time.Second, TLSHandshakeTimeout: 5 * time.Second, ExpectContinueTimeout: 1 * time.Second}}}
+	g := &Gateway{admitted: make(chan struct{}, c.Workers+c.QueueSize), running: make(chan struct{}, c.Workers), maxBody: c.MaxBodyBytes, transport: &http.Transport{MaxIdleConns: 256, MaxIdleConnsPerHost: 64, IdleConnTimeout: 90 * time.Second, TLSHandshakeTimeout: 5 * time.Second, ExpectContinueTimeout: 1 * time.Second}}
+	for _, cidr := range c.TrustedProxies {
+		prefix, err := netip.ParsePrefix(cidr)
+		if err != nil {
+			g.Close()
+			return nil, fmt.Errorf("trusted proxy %q must be a CIDR such as 10.0.0.0/8: %w", cidr, err)
+		}
+		g.trustedProxies = append(g.trustedProxies, prefix.Masked())
+	}
 	for _, rc := range c.Routes {
 		r, err := compileRoute(rc)
 		if err != nil {
 			g.Close()
 			return nil, err
 		}
-		u, err := url.Parse(rc.Upstream)
-		if err != nil || u.Scheme == "" || u.Host == "" {
+		target, err := url.Parse(rc.Upstream)
+		if err != nil || target.Scheme == "" || target.Host == "" {
 			g.Close()
-			return nil, errors.New("route " + rc.Name + ": upstream must be an absolute URL")
+			return nil, fmt.Errorf("route %q: upstream must be an absolute URL", r.config.Name)
 		}
-		r.config.Upstream = u.String()
-		g.routes = append(g.routes, runtimeRoute{route: r, gate: newGatekeeper(r.config.Gatekeeper)})
+		timeout := rc.Timeout.Duration
+		if timeout <= 0 {
+			timeout = defaultRouteTimeout
+		}
+		if timeout >= WriteTimeout {
+			g.Close()
+			return nil, fmt.Errorf("route %q: timeout must be below the server write timeout (%s)", r.config.Name, WriteTimeout)
+		}
+		if len(rc.Gatekeeper.APIKeys) == 0 {
+			slog.Warn("route has no api_keys and is public", "route", r.config.Name)
+		}
+		g.routes = append(g.routes, runtimeRoute{route: r, gate: newGatekeeper(rc.Gatekeeper), timeout: timeout, proxy: g.newProxy(target, r.config.Name)})
 	}
 	for _, lc := range c.RateLimits {
 		if lc.Route == "" {
 			g.Close()
 			return nil, errors.New("rate limit needs a route pattern")
 		}
-		policyRoute, err := compileRoute(RouteConfig{Name: lc.Route, Pattern: lc.Route, Upstream: "http://rate-limit.invalid"})
+		policyMatcher, err := compileMatcher(lc.Route, nil)
 		if err != nil {
 			g.Close()
-			return nil, err
+			return nil, fmt.Errorf("rate limit %q: %w", lc.Route, err)
 		}
-		if makeLimiter(lc) == nil {
+		switch lc.Key {
+		case "", "ip", "api_key", "ip_api_key":
+		default:
 			g.Close()
-			return nil, errors.New("rate limit " + lc.Route + " needs a positive limit")
+			return nil, fmt.Errorf("rate limit %q: unknown key %q (want ip, api_key or ip_api_key)", lc.Route, lc.Key)
 		}
-		g.rateLimits = append(g.rateLimits, runtimeRateLimit{route: policyRoute, config: lc, limiter: makeLimiter(lc)})
+		policyLimiter, err := makeLimiter(lc)
+		if err != nil {
+			g.Close()
+			return nil, fmt.Errorf("rate limit %q: %w", lc.Route, err)
+		}
+		g.rateLimits = append(g.rateLimits, runtimeRateLimit{matcher: policyMatcher, config: lc, limiter: policyLimiter})
 	}
 	return g, nil
 }
 
-func (g *Gateway) Close() { g.closed.Do(func() { g.pool.Close(); g.clients.CloseIdleConnections() }) }
+func (g *Gateway) Close() { g.transport.CloseIdleConnections() }
 
 func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/healthz" {
@@ -90,12 +130,8 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
-	if !route.gate.acquire() {
-		http.Error(w, "too many concurrent requests", http.StatusTooManyRequests)
-		return
-	}
 	if policy, found := g.lookupRateLimit(r.URL.Path, r.Method); found {
-		allowed, retry := policy.limiter.Allow(limitKey(policy.config.Key, route.gate.header, r), time.Now())
+		allowed, retry := policy.limiter.Allow(limitKey(policy.config.Key, g.clientIP(r), r.Header.Get(route.gate.header)), time.Now())
 		if !allowed {
 			seconds := int(retry.Seconds())
 			if retry%time.Second != 0 {
@@ -109,25 +145,42 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	done := make(chan struct{})
-	if err := g.pool.Submit(r.Context(), func() { defer close(done); defer route.gate.release(); g.proxy(w, r, route) }); err != nil {
-		route.gate.release()
+	if !route.gate.acquire() {
+		http.Error(w, "too many concurrent requests", http.StatusTooManyRequests)
+		return
+	}
+	defer route.gate.release()
+	select {
+	case g.admitted <- struct{}{}:
+		defer func() { <-g.admitted }()
+	default:
+		g.logOverload(time.Now())
 		w.Header().Set("Retry-After", "1")
 		http.Error(w, "gateway overloaded", http.StatusServiceUnavailable)
 		return
 	}
-	<-done
+	select {
+	case g.running <- struct{}{}:
+		defer func() { <-g.running }()
+	case <-r.Context().Done():
+		return // the client gave up while waiting for a worker
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), route.timeout)
+	defer cancel()
+	route.proxy.ServeHTTP(w, r.WithContext(ctx))
 }
 
 type runtimeRoute struct {
 	route
-	gate gatekeeper
+	gate    gatekeeper
+	timeout time.Duration
+	proxy   *httputil.ReverseProxy
 }
 
 type runtimeRateLimit struct {
-	route
+	matcher
 	config  RateLimitConfig
-	limiter limiter
+	limiter *keyedLimiter
 }
 
 func (g *Gateway) lookup(path, method string) (runtimeRoute, bool) {
@@ -154,11 +207,10 @@ func (g *Gateway) lookupRateLimit(path, method string) (runtimeRateLimit, bool) 
 	return best, found
 }
 
-// Gatekeeper checks the API key and scope before scarce worker capacity is used.
+// Gatekeeper checks the API key before scarce worker capacity is used.
 type gatekeeper struct {
 	keys   map[string]struct{}
 	header string
-	scopes map[string]struct{}
 	sem    chan struct{}
 }
 
@@ -171,34 +223,18 @@ func newGatekeeper(c GatekeeperConfig) gatekeeper {
 	if header == "" {
 		header = "X-API-Key"
 	}
-	scopes := map[string]struct{}{}
-	for _, s := range c.RequiredScopes {
-		scopes[s] = struct{}{}
-	}
 	var sem chan struct{}
 	if c.MaxConcurrentCalls > 0 {
 		sem = make(chan struct{}, c.MaxConcurrentCalls)
 	}
-	return gatekeeper{keys: keys, header: header, scopes: scopes, sem: sem}
+	return gatekeeper{keys: keys, header: header, sem: sem}
 }
 func (g gatekeeper) authorized(r *http.Request) bool {
-	if len(g.keys) > 0 {
-		if _, ok := g.keys[r.Header.Get(g.header)]; !ok {
-			return false
-		}
+	if len(g.keys) == 0 {
+		return true
 	}
-	if len(g.scopes) > 0 {
-		have := map[string]struct{}{}
-		for _, s := range strings.Fields(r.Header.Get("X-Scopes")) {
-			have[s] = struct{}{}
-		}
-		for s := range g.scopes {
-			if _, ok := have[s]; !ok {
-				return false
-			}
-		}
-	}
-	return true
+	_, ok := g.keys[r.Header.Get(g.header)]
+	return ok
 }
 func (g gatekeeper) acquire() bool {
 	if g.sem == nil {
@@ -217,56 +253,85 @@ func (g gatekeeper) release() {
 	}
 }
 
-func (g *Gateway) proxy(w http.ResponseWriter, r *http.Request, rt runtimeRoute) {
-	target, _ := url.Parse(rt.config.Upstream)
-	ctx := r.Context()
-	timeout := rt.config.Timeout.Duration
-	if timeout <= 0 {
-		timeout = 60 * time.Second
-	}
-	var cancel context.CancelFunc
-	ctx, cancel = context.WithTimeout(ctx, timeout)
-	defer cancel()
-	clone := r.Clone(ctx)
-	clone.RequestURI = ""
-	clone.URL.Scheme = target.Scheme
-	clone.URL.Host = target.Host
-	clone.URL.Path = joinURLPath(target.Path, r.URL.Path)
-	clone.Host = target.Host
-	clone.Header.Del("Connection")
-	clone.Header.Del("Proxy-Connection")
-	clone.Header.Del("X-Gateway-Client-IP")
-	clone.Header.Del("X-Gateway-Route")
-	clone.Header.Set("X-Forwarded-For", clientIP(r))
-	clone.Header.Set("X-Forwarded-Proto", requestScheme(r))
-	// Trusted metadata lets the moderation model associate a verdict with the
-	// source without accepting spoofed client-provided gateway headers.
-	clone.Header.Set("X-Gateway-Client-IP", clientIP(r))
-	clone.Header.Set("X-Gateway-Route", rt.config.Name)
-	resp, err := g.clients.Do(clone)
-	if err != nil {
-		http.Error(w, "upstream unavailable", http.StatusBadGateway)
+// logOverload records a 503 and logs the rejections accumulated since the last
+// line, so a sustained overload yields one line per interval, not one per request.
+func (g *Gateway) logOverload(now time.Time) {
+	g.overloadRejections.Add(1)
+	last := g.lastOverloadLog.Load()
+	if now.UnixNano()-last < int64(overloadLogInterval) || !g.lastOverloadLog.CompareAndSwap(last, now.UnixNano()) {
 		return
 	}
-	defer resp.Body.Close()
-	for k, vs := range resp.Header {
-		for _, v := range vs {
-			w.Header().Add(k, v)
-		}
-	}
-	w.WriteHeader(resp.StatusCode)
-	_, _ = io.Copy(w, resp.Body)
+	slog.Warn("gateway overloaded, requests rejected", "rejected", g.overloadRejections.Swap(0), "interval", overloadLogInterval)
 }
 
-func joinURLPath(base, path string) string {
-	return strings.TrimRight(base, "/") + "/" + strings.TrimLeft(path, "/")
-}
-func clientIP(r *http.Request) string {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err == nil {
-		return host
+func (g *Gateway) newProxy(target *url.URL, routeName string) *httputil.ReverseProxy {
+	return &httputil.ReverseProxy{
+		Transport: g.transport,
+		// ReverseProxy has already stripped hop-by-hop and X-Forwarded-* headers.
+		Rewrite: func(pr *httputil.ProxyRequest) {
+			pr.SetURL(target)
+			ip := g.clientIP(pr.In)
+			pr.Out.Header.Set("X-Forwarded-For", ip)
+			pr.Out.Header.Set("X-Forwarded-Proto", requestScheme(pr.In))
+			// Trusted metadata lets the moderation model associate a verdict with the
+			// source; Set replaces any spoofed copy the client sent.
+			pr.Out.Header.Set("X-Gateway-Client-IP", ip)
+			pr.Out.Header.Set("X-Gateway-Route", routeName)
+		},
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			status := http.StatusBadGateway
+			var tooLarge *http.MaxBytesError
+			switch {
+			case errors.As(err, &tooLarge):
+				status = http.StatusRequestEntityTooLarge
+			case errors.Is(r.Context().Err(), context.DeadlineExceeded):
+				status = http.StatusGatewayTimeout
+			case r.Context().Err() != nil:
+				return // the client went away; nobody reads the response
+			}
+			slog.Error("upstream request failed", "route", routeName, "status", status, "error", err)
+			http.Error(w, http.StatusText(status), status)
+		},
 	}
-	return r.RemoteAddr
+}
+
+// clientIP returns the peer address or, when the peer is a trusted proxy, the
+// rightmost X-Forwarded-For hop that is not a trusted proxy. Hops to the left
+// of it were written by the client and cannot be trusted.
+func (g *Gateway) clientIP(r *http.Request) string {
+	ip := r.RemoteAddr
+	if host, _, err := net.SplitHostPort(ip); err == nil {
+		ip = host
+	}
+	if !g.isTrustedProxy(ip) {
+		return ip
+	}
+	hops := strings.Split(strings.Join(r.Header.Values("X-Forwarded-For"), ","), ",")
+	for i := len(hops) - 1; i >= 0; i-- {
+		hop := strings.TrimSpace(hops[i])
+		if g.isTrustedProxy(hop) {
+			continue
+		}
+		if _, err := netip.ParseAddr(hop); err != nil {
+			return ip
+		}
+		return hop
+	}
+	return ip
+}
+
+func (g *Gateway) isTrustedProxy(ip string) bool {
+	addr, err := netip.ParseAddr(ip)
+	if err != nil {
+		return false
+	}
+	addr = addr.Unmap()
+	for _, prefix := range g.trustedProxies {
+		if prefix.Contains(addr) {
+			return true
+		}
+	}
+	return false
 }
 func requestScheme(r *http.Request) string {
 	if r.TLS != nil {
@@ -274,8 +339,7 @@ func requestScheme(r *http.Request) string {
 	}
 	return "http"
 }
-func limitKey(kind, credentialHeader string, r *http.Request) string {
-	ip, key := clientIP(r), r.Header.Get(credentialHeader)
+func limitKey(kind, ip, key string) string {
 	switch kind {
 	case "ip":
 		return ip

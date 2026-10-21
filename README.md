@@ -1,71 +1,96 @@
 # Enois Cloud API Gateway
 
-Gateway reverso em Go para serviços Cloud/ML. A configuração de exemplo expõe
-uma API de moderação que envia textos e sinais de comportamento ao serviço ML,
-para detectar spam, texto aleatório e abuso. O gateway controla a admissão
-antes de enviar chamadas ao upstream e mantém o número de goroutines em
-trabalho limitado.
+Reverse gateway in Go for Cloud/ML services. The example configuration exposes
+a moderation API that sends text and behavioral signals to the ML service to
+detect spam, random text and abuse. The gateway applies admission control
+before calling the upstream and keeps the number of concurrent upstream calls
+bounded.
 
-## Executar
+## Run
 
 ```bash
 cp gateway.example.yaml gateway.yaml
 go run ./cmd/gateway -config gateway.yaml
 ```
 
-O endpoint `GET /healthz` não passa pelo proxy. Para cada rota, o gateway aceita:
+`GET /healthz` is answered by the gateway itself and never proxied. For each
+route, the gateway supports:
 
-- padrões exatos (`/v1/models`), parâmetros de segmento (`/v1/models/{id}`),
-  curinga de um segmento (`/users/*`), curinga recursivo (`/users/**`) e regex
-  (`re:^/v1/models/[a-z]+$`). A rota mais específica vence sobre um curinga;
-- Gatekeeper com um header configurável por rota (padrão `X-API-Key`) e escopos
-  em `X-Scopes` (separados por espaços),
-  mais um teto de chamadas simultâneas por rota;
-- uma lista global `rate_limit`, com uma rota por regra e chaves `ip`,
-  `api_key` ou `ip_api_key`; os padrões disponíveis são `token_bucket`,
-  `fixed_window` e `sliding_window`.
+- exact patterns (`/v1/models`), segment parameters (`/v1/models/{id}`),
+  one-segment wildcards (`/users/*`), recursive wildcards (`/users/**`) and
+  regex (`re:^/v1/models/[a-z]+$`). The most specific route wins, scored per
+  segment: literal > `{param}` > `*` > `**`. Regex routes score lowest, and on
+  a tie the route declared first wins;
+- a Gatekeeper with a per-route credential header (default `X-API-Key`) and a
+  cap on concurrent calls per route. A route without `api_keys` is public; the
+  gateway logs a warning for it at boot;
+- a global `rate_limit` list, one route pattern per rule, keyed by `ip`,
+  `api_key` or `ip_api_key`, using `token_bucket`, `fixed_window` or
+  `sliding_window`. An unknown pattern or key fails at boot.
 
-Para a rota de moderação, envie ao modelo o texto e os sinais que ele espera,
-por exemplo `{"text":"...","event":"comment","account_age_days":2}`.
-O body é transmitido sem alterações; a decisão do modelo (por exemplo,
-`allow`, `review` ou `block`) e a pontuação retornam ao cliente. O gateway
-acrescenta somente os metadados confiáveis `X-Gateway-Client-IP` e
-`X-Gateway-Route`, depois de remover cópias enviadas pelo cliente. Isso permite
-que o modelo correlacione reincidência sem confiar em cabeçalhos falsificados.
+For the moderation route, send the model the text and the signals it expects,
+for example `{"text":"...","event":"comment","account_age_days":2}`. The body
+is forwarded unchanged, and the model's decision (for example `allow`,
+`review` or `block`) and score are returned to the client. The gateway only
+adds the trusted metadata headers `X-Gateway-Client-IP` and `X-Gateway-Route`,
+replacing any copies sent by the client, so the model can correlate repeat
+offenders without trusting spoofed headers.
 
-Quando uma fila ou limite de concorrência está cheia, a chamada é recusada em
-vez de criar goroutines sem limite (`503` para pool lotado e `429` para rate
-limit/concurrency). Cada worker encaminha uma solicitação e aguarda a resposta
-do upstream; o timeout também cancela o request ao serviço ML.
+### Admission and errors
 
-### Token bucket e rotas recursivas
+`workers` caps concurrent upstream calls and `queue_size` caps how many more
+requests may wait for a worker. A request arriving with both full is rejected
+with `503` and counted in a warning logged at most once per second; a request
+whose client disconnects while waiting is dropped. Rate
+limits and the per-route concurrency cap answer `429` (with `Retry-After` for
+rate limits).
 
-Com `limit: 30`, `window: 1m` e `burst: 5`, cada chave (neste caso,
-IP + credencial) começa com cinco tokens e volta a receber, em média, um token
-a cada dois segundos. Cada chamada consome um token. Sem tokens, recebe `429`
-com `Retry-After`; em um minuto não passam mais de 30 chamadas sustentadas por
-chave. O valor de credencial usado pelo rate limit é o mesmo de
-`gatekeeper.header`.
+Upstream failures are logged and mapped to `413` (body above
+`max_body_bytes`), `504` (route `timeout`, default 30s) or `502`. A route
+timeout must stay below the server write timeout (60s); the gateway refuses to
+start otherwise.
 
-Para aplicar políticas independentes a várias árvores de rotas, use a lista
-global `rate_limit`. A regra mais específica aplicável vence:
+### Client IP behind a reverse proxy
+
+By default the client IP is the TCP peer address. When the gateway runs behind
+a reverse proxy (Traefik, a load balancer), list the proxy networks in
+`trusted_proxies`:
 
 ```yaml
-- route: /users/** # /users/42 e /users/42/comments/7
+trusted_proxies: [10.0.0.0/8]
+```
+
+For requests coming from a trusted proxy, the client IP is the rightmost
+`X-Forwarded-For` hop that is not itself a trusted proxy. Without this, every
+client shares the proxy's IP, so `ip` rate limits become one global bucket.
+
+### Token bucket and recursive routes
+
+With `limit: 30`, `window: 1m` and `burst: 5`, each key (here, IP + credential)
+starts with five tokens and gets one token back every two seconds on average.
+Each call spends one token. Without tokens the call gets `429` with
+`Retry-After`; no key sustains more than 30 calls per minute. The credential
+used by the rate limit comes from the route's `gatekeeper.header`.
+
+To apply independent policies to several route trees, use the global
+`rate_limit` list. The most specific matching rule wins:
+
+```yaml
+- route: /users/** # /users/42 and /users/42/comments/7
   pattern: token_bucket
   limit: 30
   window: 1m
   burst: 5
   key: ip_api_key
-- route: /users/me # prevalece sobre /users/**
+- route: /users/me # wins over /users/**
   pattern: fixed_window
   limit: 10
   window: 1m
   key: ip_api_key
 ```
 
-As rotas de proxy continuam em `routes`; elas definem o upstream, métodos e o
-Gatekeeper. Por exemplo:
+Proxy routes stay under `routes`; they define the upstream, methods and the
+Gatekeeper. For example:
 
 ```yaml
 routes:
@@ -78,17 +103,16 @@ routes:
       api_keys: [replace-with-a-secret]
 ```
 
-## Verificação
+## Verification
 
 ```bash
 go test ./...
 go vet ./...
 ```
 
-Para produção, injete as chaves por um gerenciador de segredos ao gerar o JSON;
-não faça commit delas. Os limites são locais à instância. Para um limite global
-em múltiplas réplicas, substitua o armazenamento em memória por Redis ou outro
-backplane atômico.
+In production, inject the keys from a secrets manager when rendering the YAML;
+never commit them. Limits are local to each instance. For a global limit across
+replicas, replace the in-memory store with Redis or another atomic backplane.
 
 ## Container
 
@@ -97,8 +121,10 @@ docker build -t enois-gateway .
 docker run --rm -p 8080:8080 -v "$PWD/gateway.yaml:/etc/enois/gateway.yaml:ro" enois-gateway
 ```
 
-O `Dockerfile` usa build multi-stage, binário estático sem símbolos, imagem
-`scratch`, CA certificates para upstreams HTTPS e usuário não-root. No YAML,
-`gatekeeper.header` escolhe de onde a chave vem; por exemplo, use
-`header: Authorization` se o cliente enviar o token nesse header (o valor deve
-corresponder exatamente a uma entrada em `api_keys`).
+The image ships no configuration, so mounting one at
+`/etc/enois/gateway.yaml` is required; without it the gateway fails at boot.
+The `Dockerfile` uses a multi-stage build, a static stripped binary, a
+`scratch` image, CA certificates for HTTPS upstreams and a non-root user. In
+the YAML, `gatekeeper.header` picks where the key comes from; for example, use
+`header: Authorization` if the client sends the token there (the value must
+match an entry in `api_keys` exactly).
