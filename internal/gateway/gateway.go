@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -57,16 +58,23 @@ func New(c Config) (*Gateway, error) {
 			g.Close()
 			return nil, errors.New("rate limit needs a route pattern")
 		}
-		policyRoute, err := compileRoute(RouteConfig{Name: lc.Route, Pattern: lc.Route, Upstream: "http://rate-limit.invalid"})
+		policyMatcher, err := compileMatcher(lc.Route, nil)
 		if err != nil {
 			g.Close()
-			return nil, err
+			return nil, fmt.Errorf("rate limit %q: %w", lc.Route, err)
 		}
-		if makeLimiter(lc) == nil {
+		switch lc.Key {
+		case "", "ip", "api_key", "ip_api_key":
+		default:
 			g.Close()
-			return nil, errors.New("rate limit " + lc.Route + " needs a positive limit")
+			return nil, fmt.Errorf("rate limit %q: unknown key %q (want ip, api_key or ip_api_key)", lc.Route, lc.Key)
 		}
-		g.rateLimits = append(g.rateLimits, runtimeRateLimit{route: policyRoute, config: lc, limiter: makeLimiter(lc)})
+		policyLimiter, err := makeLimiter(lc)
+		if err != nil {
+			g.Close()
+			return nil, fmt.Errorf("rate limit %q: %w", lc.Route, err)
+		}
+		g.rateLimits = append(g.rateLimits, runtimeRateLimit{matcher: policyMatcher, config: lc, limiter: policyLimiter})
 	}
 	return g, nil
 }
@@ -134,7 +142,7 @@ type runtimeRoute struct {
 }
 
 type runtimeRateLimit struct {
-	route
+	matcher
 	config  RateLimitConfig
 	limiter *keyedLimiter
 }

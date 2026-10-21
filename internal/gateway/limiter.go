@@ -1,6 +1,8 @@
 package gateway
 
 import (
+	"errors"
+	"fmt"
 	"math"
 	"sync"
 	"time"
@@ -109,13 +111,13 @@ func (s *slidingWindow) Allow(now time.Time) (bool, time.Duration) {
 	return true, 0
 }
 
-func makeLimiter(c RateLimitConfig) *keyedLimiter {
+func makeLimiter(c RateLimitConfig) (*keyedLimiter, error) {
 	window := c.Window.Duration
 	if window <= 0 {
 		window = time.Minute
 	}
 	if c.Limit <= 0 {
-		return nil
+		return nil, errors.New("limit must be positive")
 	}
 	burst := c.Burst
 	if burst <= 0 {
@@ -123,13 +125,15 @@ func makeLimiter(c RateLimitConfig) *keyedLimiter {
 	}
 	switch c.Pattern {
 	case "fixed_window":
-		return newKeyedLimiter(func() limiter { return &fixedWindow{limit: c.Limit, window: window} }, window)
+		return newKeyedLimiter(func() limiter { return &fixedWindow{limit: c.Limit, window: window} }, window), nil
 	case "sliding_window":
-		return newKeyedLimiter(func() limiter { return &slidingWindow{limit: c.Limit, window: window} }, window)
-	default:
+		return newKeyedLimiter(func() limiter { return &slidingWindow{limit: c.Limit, window: window} }, window), nil
+	case "", "token_bucket":
 		rate := float64(c.Limit) / window.Seconds()
 		// An empty bucket is full again after burst/rate seconds.
 		refill := time.Duration(float64(burst) / rate * float64(time.Second))
-		return newKeyedLimiter(func() limiter { return &tokenBucket{rate: rate, burst: float64(burst)} }, max(window, refill))
+		return newKeyedLimiter(func() limiter { return &tokenBucket{rate: rate, burst: float64(burst)} }, max(window, refill)), nil
+	default:
+		return nil, fmt.Errorf("unknown pattern %q (want token_bucket, fixed_window or sliding_window)", c.Pattern)
 	}
 }

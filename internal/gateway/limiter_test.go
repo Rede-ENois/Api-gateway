@@ -22,7 +22,10 @@ func TestLimiters(t *testing.T) {
 			[]time.Duration{0, 30 * time.Second, 59 * time.Second, 61 * time.Second, 62 * time.Second}, []bool{true, true, false, true, false}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			l := makeLimiter(tc.config)
+			l, err := makeLimiter(tc.config)
+			if err != nil {
+				t.Fatal(err)
+			}
 			for i, offset := range tc.calls {
 				if got, _ := l.Allow("k", at(offset)); got != tc.allowed[i] {
 					t.Fatalf("call %d at %v: got %v, want %v", i, offset, got, tc.allowed[i])
@@ -33,7 +36,10 @@ func TestLimiters(t *testing.T) {
 }
 
 func TestKeyedLimiterEvictsIdleKeys(t *testing.T) {
-	l := makeLimiter(RateLimitConfig{Pattern: "fixed_window", Limit: 1, Window: Duration{time.Minute}})
+	l, err := makeLimiter(RateLimitConfig{Pattern: "fixed_window", Limit: 1, Window: Duration{time.Minute}})
+	if err != nil {
+		t.Fatal(err)
+	}
 	now := time.Unix(0, 0)
 	for _, key := range []string{"a", "b", "c"} {
 		l.Allow(key, now)

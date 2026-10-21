@@ -86,15 +86,45 @@ func TestPatterns(t *testing.T) {
 	}
 }
 
-func TestMoreSpecificRouteWinsOverWildcard(t *testing.T) {
-	g, err := New(Config{Routes: []RouteConfig{{Name: "all-users", Pattern: "/users/**", Upstream: "http://wildcard.example.test"}, {Name: "profile", Pattern: "/users/me", Upstream: "http://profile.example.test"}}})
-	if err != nil {
-		t.Fatal(err)
+func TestMostSpecificRouteWins(t *testing.T) {
+	for _, tc := range []struct {
+		patterns []string
+		path     string
+		want     string
+	}{
+		{[]string{"/users/**", "/users/me"}, "/users/me", "/users/me"},
+		{[]string{"/users/{userIdentifier}", "/users/me"}, "/users/me", "/users/me"},
+		{[]string{"/users/*", "/users/{id}"}, "/users/42", "/users/{id}"},
+		{[]string{"/users/**", "/users/*"}, "/users/42", "/users/*"},
+		{[]string{"/users/**", "/users/{id}/comments"}, "/users/42/comments", "/users/{id}/comments"},
+		{[]string{"re:^/users/.*$", "/users/**"}, "/users/42", "/users/**"},
+	} {
+		var routes []RouteConfig
+		for _, p := range tc.patterns {
+			routes = append(routes, RouteConfig{Pattern: p, Upstream: "http://u.example.test"})
+		}
+		g, err := New(Config{Routes: routes})
+		if err != nil {
+			t.Fatal(err)
+		}
+		route, ok := g.lookup(tc.path, http.MethodGet)
+		if !ok || route.config.Pattern != tc.want {
+			t.Errorf("%v on %s: got %q, want %q", tc.patterns, tc.path, route.config.Pattern, tc.want)
+		}
+		g.Close()
 	}
-	defer g.Close()
-	route, ok := g.lookup("/users/me", http.MethodGet)
-	if !ok || route.config.Name != "profile" {
-		t.Fatalf("expected the specific route, got %#v", route.config)
+}
+
+func TestNewRejectsInvalidRateLimits(t *testing.T) {
+	for name, rl := range map[string]RateLimitConfig{
+		"unknown pattern": {Route: "/x", Pattern: "fixed-window", Limit: 1},
+		"unknown key":     {Route: "/x", Limit: 1, Key: "token"},
+		"zero limit":      {Route: "/x"},
+		"missing route":   {Limit: 1},
+	} {
+		if _, err := New(Config{RateLimits: []RateLimitConfig{rl}}); err == nil {
+			t.Errorf("%s: expected an error", name)
+		}
 	}
 }
 
