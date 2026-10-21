@@ -1,0 +1,23 @@
+listen: ":8080"
+workers: 64
+queue_size: 512
+max_body_bytes: 10485760
+rate_limit:
+  - route: /v1/moderation/**
+    pattern: token_bucket
+    limit: 30
+    window: 1m
+    burst: 5
+    key: ip_api_key
+routes:
+  - name: ml-content-moderation
+    pattern: /v1/moderation/check
+    methods: [POST]
+    upstream: http://ml-moderation:8000
+    timeout: 45s
+    gatekeeper:
+      # Pode ser Authorization, X-Client-Token ou qualquer header HTTP válido.
+      header: X-Client-Token
+      api_keys: [replace-with-a-secret]
+      required_scopes: [moderation:check]
+      max_concurrent_calls: 16
