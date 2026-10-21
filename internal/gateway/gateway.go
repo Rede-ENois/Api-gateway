@@ -9,7 +9,6 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -17,10 +16,12 @@ import (
 type Gateway struct {
 	routes     []runtimeRoute
 	rateLimits []runtimeRateLimit
-	pool       *Pool
-	maxBody    int64
-	clients    *http.Client
-	closed     sync.Once
+	// admitted bounds requests running or waiting for a worker (workers +
+	// queue_size); running bounds concurrent upstream calls (workers).
+	admitted chan struct{}
+	running  chan struct{}
+	maxBody  int64
+	clients  *http.Client
 }
 
 func New(c Config) (*Gateway, error) {
@@ -36,7 +37,7 @@ func New(c Config) (*Gateway, error) {
 	if c.MaxBodyBytes <= 0 {
 		c.MaxBodyBytes = 10 << 20
 	}
-	g := &Gateway{pool: NewPool(c.Workers, c.QueueSize), maxBody: c.MaxBodyBytes, clients: &http.Client{Transport: &http.Transport{MaxIdleConns: 256, MaxIdleConnsPerHost: 64, IdleConnTimeout: 90 * time.Second, TLSHandshakeTimeout: 5 * time.Second, ExpectContinueTimeout: 1 * time.Second}}}
+	g := &Gateway{admitted: make(chan struct{}, c.Workers+c.QueueSize), running: make(chan struct{}, c.Workers), maxBody: c.MaxBodyBytes, clients: &http.Client{Transport: &http.Transport{MaxIdleConns: 256, MaxIdleConnsPerHost: 64, IdleConnTimeout: 90 * time.Second, TLSHandshakeTimeout: 5 * time.Second, ExpectContinueTimeout: 1 * time.Second}}}
 	for _, rc := range c.Routes {
 		r, err := compileRoute(rc)
 		if err != nil {
@@ -70,7 +71,7 @@ func New(c Config) (*Gateway, error) {
 	return g, nil
 }
 
-func (g *Gateway) Close() { g.closed.Do(func() { g.pool.Close(); g.clients.CloseIdleConnections() }) }
+func (g *Gateway) Close() { g.clients.CloseIdleConnections() }
 
 func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/healthz" {
@@ -90,10 +91,6 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
-	if !route.gate.acquire() {
-		http.Error(w, "too many concurrent requests", http.StatusTooManyRequests)
-		return
-	}
 	if policy, found := g.lookupRateLimit(r.URL.Path, r.Method); found {
 		allowed, retry := policy.limiter.Allow(limitKey(policy.config.Key, route.gate.header, r), time.Now())
 		if !allowed {
@@ -109,14 +106,26 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	done := make(chan struct{})
-	if err := g.pool.Submit(r.Context(), func() { defer close(done); defer route.gate.release(); g.proxy(w, r, route) }); err != nil {
-		route.gate.release()
+	if !route.gate.acquire() {
+		http.Error(w, "too many concurrent requests", http.StatusTooManyRequests)
+		return
+	}
+	defer route.gate.release()
+	select {
+	case g.admitted <- struct{}{}:
+		defer func() { <-g.admitted }()
+	default:
 		w.Header().Set("Retry-After", "1")
 		http.Error(w, "gateway overloaded", http.StatusServiceUnavailable)
 		return
 	}
-	<-done
+	select {
+	case g.running <- struct{}{}:
+		defer func() { <-g.running }()
+	case <-r.Context().Done():
+		return // the client gave up while waiting for a worker
+	}
+	g.proxy(w, r, route)
 }
 
 type runtimeRoute struct {
@@ -127,7 +136,7 @@ type runtimeRoute struct {
 type runtimeRateLimit struct {
 	route
 	config  RateLimitConfig
-	limiter limiter
+	limiter *keyedLimiter
 }
 
 func (g *Gateway) lookup(path, method string) (runtimeRoute, bool) {

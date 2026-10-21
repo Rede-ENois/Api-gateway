@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -94,5 +95,85 @@ func TestMoreSpecificRouteWinsOverWildcard(t *testing.T) {
 	route, ok := g.lookup("/users/me", http.MethodGet)
 	if !ok || route.config.Name != "profile" {
 		t.Fatalf("expected the specific route, got %#v", route.config)
+	}
+}
+
+func okResponse(r *http.Request) (*http.Response, error) {
+	return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("ok")), Request: r}, nil
+}
+
+func TestRateLimitedRequestReleasesConcurrencySlot(t *testing.T) {
+	g, err := New(Config{
+		RateLimits: []RateLimitConfig{{Route: "/x", Pattern: "fixed_window", Limit: 1, Window: Duration{Duration: time.Hour}, Key: "ip"}},
+		Routes:     []RouteConfig{{Name: "x", Pattern: "/x", Upstream: "http://u.example.test", Gatekeeper: GatekeeperConfig{MaxConcurrentCalls: 1}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g.Close()
+	g.clients.Transport = roundTripFunc(okResponse)
+	for _, want := range []int{http.StatusOK, http.StatusTooManyRequests, http.StatusTooManyRequests} {
+		rr := httptest.NewRecorder()
+		g.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/x", nil))
+		if rr.Code != want {
+			t.Fatalf("got %d, want %d", rr.Code, want)
+		}
+	}
+	if held := len(g.routes[0].gate.sem); held != 0 {
+		t.Fatalf("%d concurrency slots held with no request in flight", held)
+	}
+}
+
+func TestRequestCancelledWhileQueuedReturnsAndReleasesSlots(t *testing.T) {
+	g, err := New(Config{Workers: 1, QueueSize: 1, Routes: []RouteConfig{{Name: "x", Pattern: "/x", Upstream: "http://u.example.test", Gatekeeper: GatekeeperConfig{MaxConcurrentCalls: 2}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g.Close()
+	started, unblock := make(chan struct{}), make(chan struct{})
+	g.clients.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		close(started)
+		<-unblock
+		return okResponse(r)
+	})
+	first := make(chan struct{})
+	go func() {
+		g.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/x", nil))
+		close(first)
+	}()
+	<-started
+
+	// The only worker is busy, so this request waits in the queue until cancelled.
+	ctx, cancel := context.WithCancel(context.Background())
+	queued := make(chan struct{})
+	go func() {
+		g.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/x", nil).WithContext(ctx))
+		close(queued)
+	}()
+	cancel()
+	select {
+	case <-queued:
+	case <-time.After(time.Second):
+		t.Fatal("queued handler did not return after its client cancelled")
+	}
+	close(unblock)
+	<-first
+	if len(g.admitted) != 0 || len(g.running) != 0 || len(g.routes[0].gate.sem) != 0 {
+		t.Fatalf("slots leaked: admitted=%d running=%d route=%d", len(g.admitted), len(g.running), len(g.routes[0].gate.sem))
+	}
+}
+
+func TestFullQueueIsRejected(t *testing.T) {
+	g, err := New(Config{Workers: 1, QueueSize: 1, Routes: []RouteConfig{{Name: "x", Pattern: "/x", Upstream: "http://u.example.test"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g.Close()
+	g.admitted <- struct{}{}
+	g.admitted <- struct{}{}
+	rr := httptest.NewRecorder()
+	g.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/x", nil))
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("got %d, want 503", rr.Code)
 	}
 }
