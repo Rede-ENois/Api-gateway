@@ -4,9 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
+	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
 	"strconv"
 	"strings"
@@ -19,11 +20,17 @@ type Gateway struct {
 	rateLimits []runtimeRateLimit
 	// admitted bounds requests running or waiting for a worker (workers +
 	// queue_size); running bounds concurrent upstream calls (workers).
-	admitted chan struct{}
-	running  chan struct{}
-	maxBody  int64
-	clients  *http.Client
+	admitted  chan struct{}
+	running   chan struct{}
+	maxBody   int64
+	transport *http.Transport
 }
+
+// WriteTimeout is the server write timeout. Route timeouts must stay below it,
+// or the server cuts the response before the upstream call times out.
+const WriteTimeout = 60 * time.Second
+
+const defaultRouteTimeout = 30 * time.Second
 
 func New(c Config) (*Gateway, error) {
 	if c.Listen == "" {
@@ -38,20 +45,27 @@ func New(c Config) (*Gateway, error) {
 	if c.MaxBodyBytes <= 0 {
 		c.MaxBodyBytes = 10 << 20
 	}
-	g := &Gateway{admitted: make(chan struct{}, c.Workers+c.QueueSize), running: make(chan struct{}, c.Workers), maxBody: c.MaxBodyBytes, clients: &http.Client{Transport: &http.Transport{MaxIdleConns: 256, MaxIdleConnsPerHost: 64, IdleConnTimeout: 90 * time.Second, TLSHandshakeTimeout: 5 * time.Second, ExpectContinueTimeout: 1 * time.Second}}}
+	g := &Gateway{admitted: make(chan struct{}, c.Workers+c.QueueSize), running: make(chan struct{}, c.Workers), maxBody: c.MaxBodyBytes, transport: &http.Transport{MaxIdleConns: 256, MaxIdleConnsPerHost: 64, IdleConnTimeout: 90 * time.Second, TLSHandshakeTimeout: 5 * time.Second, ExpectContinueTimeout: 1 * time.Second}}
 	for _, rc := range c.Routes {
 		r, err := compileRoute(rc)
 		if err != nil {
 			g.Close()
 			return nil, err
 		}
-		u, err := url.Parse(rc.Upstream)
-		if err != nil || u.Scheme == "" || u.Host == "" {
+		target, err := url.Parse(rc.Upstream)
+		if err != nil || target.Scheme == "" || target.Host == "" {
 			g.Close()
-			return nil, errors.New("route " + rc.Name + ": upstream must be an absolute URL")
+			return nil, fmt.Errorf("route %q: upstream must be an absolute URL", r.config.Name)
 		}
-		r.config.Upstream = u.String()
-		g.routes = append(g.routes, runtimeRoute{route: r, gate: newGatekeeper(r.config.Gatekeeper)})
+		timeout := rc.Timeout.Duration
+		if timeout <= 0 {
+			timeout = defaultRouteTimeout
+		}
+		if timeout >= WriteTimeout {
+			g.Close()
+			return nil, fmt.Errorf("route %q: timeout must be below the server write timeout (%s)", r.config.Name, WriteTimeout)
+		}
+		g.routes = append(g.routes, runtimeRoute{route: r, gate: newGatekeeper(rc.Gatekeeper), timeout: timeout, proxy: g.newProxy(target, r.config.Name)})
 	}
 	for _, lc := range c.RateLimits {
 		if lc.Route == "" {
@@ -79,7 +93,7 @@ func New(c Config) (*Gateway, error) {
 	return g, nil
 }
 
-func (g *Gateway) Close() { g.clients.CloseIdleConnections() }
+func (g *Gateway) Close() { g.transport.CloseIdleConnections() }
 
 func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/healthz" {
@@ -133,12 +147,16 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case <-r.Context().Done():
 		return // the client gave up while waiting for a worker
 	}
-	g.proxy(w, r, route)
+	ctx, cancel := context.WithTimeout(r.Context(), route.timeout)
+	defer cancel()
+	route.proxy.ServeHTTP(w, r.WithContext(ctx))
 }
 
 type runtimeRoute struct {
 	route
-	gate gatekeeper
+	gate    gatekeeper
+	timeout time.Duration
+	proxy   *httputil.ReverseProxy
 }
 
 type runtimeRateLimit struct {
@@ -234,50 +252,37 @@ func (g gatekeeper) release() {
 	}
 }
 
-func (g *Gateway) proxy(w http.ResponseWriter, r *http.Request, rt runtimeRoute) {
-	target, _ := url.Parse(rt.config.Upstream)
-	ctx := r.Context()
-	timeout := rt.config.Timeout.Duration
-	if timeout <= 0 {
-		timeout = 60 * time.Second
+func (g *Gateway) newProxy(target *url.URL, routeName string) *httputil.ReverseProxy {
+	return &httputil.ReverseProxy{
+		Transport: g.transport,
+		// ReverseProxy has already stripped hop-by-hop and X-Forwarded-* headers.
+		Rewrite: func(pr *httputil.ProxyRequest) {
+			pr.SetURL(target)
+			ip := clientIP(pr.In)
+			pr.Out.Header.Set("X-Forwarded-For", ip)
+			pr.Out.Header.Set("X-Forwarded-Proto", requestScheme(pr.In))
+			// Trusted metadata lets the moderation model associate a verdict with the
+			// source; Set replaces any spoofed copy the client sent.
+			pr.Out.Header.Set("X-Gateway-Client-IP", ip)
+			pr.Out.Header.Set("X-Gateway-Route", routeName)
+		},
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			status := http.StatusBadGateway
+			var tooLarge *http.MaxBytesError
+			switch {
+			case errors.As(err, &tooLarge):
+				status = http.StatusRequestEntityTooLarge
+			case errors.Is(r.Context().Err(), context.DeadlineExceeded):
+				status = http.StatusGatewayTimeout
+			case r.Context().Err() != nil:
+				return // the client went away; nobody reads the response
+			}
+			slog.Error("upstream request failed", "route", routeName, "status", status, "error", err)
+			http.Error(w, http.StatusText(status), status)
+		},
 	}
-	var cancel context.CancelFunc
-	ctx, cancel = context.WithTimeout(ctx, timeout)
-	defer cancel()
-	clone := r.Clone(ctx)
-	clone.RequestURI = ""
-	clone.URL.Scheme = target.Scheme
-	clone.URL.Host = target.Host
-	clone.URL.Path = joinURLPath(target.Path, r.URL.Path)
-	clone.Host = target.Host
-	clone.Header.Del("Connection")
-	clone.Header.Del("Proxy-Connection")
-	clone.Header.Del("X-Gateway-Client-IP")
-	clone.Header.Del("X-Gateway-Route")
-	clone.Header.Set("X-Forwarded-For", clientIP(r))
-	clone.Header.Set("X-Forwarded-Proto", requestScheme(r))
-	// Trusted metadata lets the moderation model associate a verdict with the
-	// source without accepting spoofed client-provided gateway headers.
-	clone.Header.Set("X-Gateway-Client-IP", clientIP(r))
-	clone.Header.Set("X-Gateway-Route", rt.config.Name)
-	resp, err := g.clients.Do(clone)
-	if err != nil {
-		http.Error(w, "upstream unavailable", http.StatusBadGateway)
-		return
-	}
-	defer resp.Body.Close()
-	for k, vs := range resp.Header {
-		for _, v := range vs {
-			w.Header().Add(k, v)
-		}
-	}
-	w.WriteHeader(resp.StatusCode)
-	_, _ = io.Copy(w, resp.Body)
 }
 
-func joinURLPath(base, path string) string {
-	return strings.TrimRight(base, "/") + "/" + strings.TrimLeft(path, "/")
-}
 func clientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err == nil {

@@ -2,7 +2,6 @@ package gateway
 
 import (
 	"context"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,46 +11,66 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-func TestGatewayAppliesRouteAuthAndRateLimit(t *testing.T) {
-	g, err := New(Config{Workers: 2, QueueSize: 2, RateLimits: []RateLimitConfig{{Route: "/v1/models/**", Pattern: "fixed_window", Limit: 1, Window: Duration{Duration: time.Minute}, Key: "api_key"}}, Routes: []RouteConfig{{
-		Name: "prediction", Pattern: "/v1/models/{model}/predict", Methods: []string{"POST"}, Upstream: "http://ml.example.test",
-		Gatekeeper: GatekeeperConfig{Header: "X-Client-Token", APIKeys: []string{"demo-key"}, RequiredScopes: []string{"predict"}},
-	}}})
+func newTestGateway(t *testing.T, c Config) *Gateway {
+	t.Helper()
+	g, err := New(c)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer g.Close()
-	g.clients.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+	t.Cleanup(g.Close)
+	return g
+}
+
+func newUpstream(t *testing.T, handler http.HandlerFunc) string {
+	t.Helper()
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
+
+func serve(g *Gateway, r *http.Request) *httptest.ResponseRecorder {
+	rr := httptest.NewRecorder()
+	g.ServeHTTP(rr, r)
+	return rr
+}
+
+func okHandler(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) }
+
+func TestGatewayAppliesRouteAuthAndRateLimit(t *testing.T) {
+	upstream := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/models/cat/predict" {
 			t.Errorf("unexpected proxied path %q", r.URL.Path)
 		}
 		if r.Header.Get("X-Gateway-Route") != "prediction" {
 			t.Errorf("missing trusted route header")
 		}
-		if r.Header.Get("X-Gateway-Client-IP") == "" {
-			t.Errorf("missing trusted client IP header")
+		if r.Header.Get("X-Gateway-Client-IP") == "spoofed" {
+			t.Errorf("client-provided X-Gateway-Client-IP reached the upstream")
 		}
-		return &http.Response{StatusCode: http.StatusAccepted, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("ok")), Request: r}, nil
+		w.WriteHeader(http.StatusAccepted)
 	})
+	g := newTestGateway(t, Config{Workers: 2, QueueSize: 2, RateLimits: []RateLimitConfig{{Route: "/v1/models/**", Pattern: "fixed_window", Limit: 1, Window: Duration{Duration: time.Minute}, Key: "api_key"}}, Routes: []RouteConfig{{
+		Name: "prediction", Pattern: "/v1/models/{model}/predict", Methods: []string{"POST"}, Upstream: upstream,
+		Gatekeeper: GatekeeperConfig{Header: "X-Client-Token", APIKeys: []string{"demo-key"}, RequiredScopes: []string{"predict"}},
+	}}})
 
 	bad := httptest.NewRequest(http.MethodPost, "/v1/models/cat/predict", nil)
 	bad.Header.Set("X-Client-Token", "wrong")
-	if rr := httptest.NewRecorder(); func() *httptest.ResponseRecorder { g.ServeHTTP(rr, bad); return rr }().Code != http.StatusForbidden {
-		t.Fatal("expected forbidden")
+	if got := serve(g, bad).Code; got != http.StatusForbidden {
+		t.Fatalf("got %d, want 403", got)
 	}
 
-	request := func() *httptest.ResponseRecorder {
+	request := func() *http.Request {
 		r := httptest.NewRequest(http.MethodPost, "/v1/models/cat/predict", nil)
 		r.Header.Set("X-Client-Token", "demo-key")
 		r.Header.Set("X-Scopes", "predict")
-		rr := httptest.NewRecorder()
-		g.ServeHTTP(rr, r)
-		return rr
+		r.Header.Set("X-Gateway-Client-IP", "spoofed")
+		return r
 	}
-	if got := request().Code; got != http.StatusAccepted {
+	if got := serve(g, request()).Code; got != http.StatusAccepted {
 		t.Fatalf("got %d", got)
 	}
-	if got := request().Code; got != http.StatusTooManyRequests {
+	if got := serve(g, request()).Code; got != http.StatusTooManyRequests {
 		t.Fatalf("got %d", got)
 	}
 }
@@ -67,20 +86,16 @@ func TestYAMLConfigAndDuration(t *testing.T) {
 	}
 }
 
-type roundTripFunc func(*http.Request) (*http.Response, error)
-
-func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
-
 func TestPatterns(t *testing.T) {
 	for _, tc := range []struct {
 		pattern, path string
 		want          bool
 	}{{"/v1/*", "/v1/a", true}, {"/v1/*", "/v1/a/b", false}, {"/users/**", "/users/a/b", true}, {"/users/**", "/users/123", true}, {"re:^/models/[0-9]+$", "/models/42", true}, {"/models/{id}", "/models/a", true}, {"/models/{id}", "/models/a/v", false}} {
-		r, err := compileRoute(RouteConfig{Pattern: tc.pattern, Upstream: "http://example.test"})
+		m, err := compileMatcher(tc.pattern, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got := r.matches(tc.path, "GET"); got != tc.want {
+		if got := m.matches(tc.path, "GET"); got != tc.want {
 			t.Fatalf("%s %s: got %v", tc.pattern, tc.path, got)
 		}
 	}
@@ -103,50 +118,40 @@ func TestMostSpecificRouteWins(t *testing.T) {
 		for _, p := range tc.patterns {
 			routes = append(routes, RouteConfig{Pattern: p, Upstream: "http://u.example.test"})
 		}
-		g, err := New(Config{Routes: routes})
-		if err != nil {
-			t.Fatal(err)
-		}
+		g := newTestGateway(t, Config{Routes: routes})
 		route, ok := g.lookup(tc.path, http.MethodGet)
 		if !ok || route.config.Pattern != tc.want {
 			t.Errorf("%v on %s: got %q, want %q", tc.patterns, tc.path, route.config.Pattern, tc.want)
 		}
-		g.Close()
 	}
 }
 
-func TestNewRejectsInvalidRateLimits(t *testing.T) {
-	for name, rl := range map[string]RateLimitConfig{
-		"unknown pattern": {Route: "/x", Pattern: "fixed-window", Limit: 1},
-		"unknown key":     {Route: "/x", Limit: 1, Key: "token"},
-		"zero limit":      {Route: "/x"},
-		"missing route":   {Limit: 1},
+func TestNewRejectsInvalidConfig(t *testing.T) {
+	route := func(timeout time.Duration) []RouteConfig {
+		return []RouteConfig{{Pattern: "/x", Upstream: "http://u.example.test", Timeout: Duration{timeout}}}
+	}
+	for name, c := range map[string]Config{
+		"unknown rate limit pattern": {RateLimits: []RateLimitConfig{{Route: "/x", Pattern: "fixed-window", Limit: 1}}},
+		"unknown rate limit key":     {RateLimits: []RateLimitConfig{{Route: "/x", Limit: 1, Key: "token"}}},
+		"zero rate limit":            {RateLimits: []RateLimitConfig{{Route: "/x"}}},
+		"rate limit without route":   {RateLimits: []RateLimitConfig{{Limit: 1}}},
+		"relative upstream":          {Routes: []RouteConfig{{Pattern: "/x", Upstream: "/relative"}}},
+		"timeout over write timeout": {Routes: route(WriteTimeout)},
 	} {
-		if _, err := New(Config{RateLimits: []RateLimitConfig{rl}}); err == nil {
+		if _, err := New(c); err == nil {
 			t.Errorf("%s: expected an error", name)
 		}
 	}
 }
 
-func okResponse(r *http.Request) (*http.Response, error) {
-	return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("ok")), Request: r}, nil
-}
-
 func TestRateLimitedRequestReleasesConcurrencySlot(t *testing.T) {
-	g, err := New(Config{
+	g := newTestGateway(t, Config{
 		RateLimits: []RateLimitConfig{{Route: "/x", Pattern: "fixed_window", Limit: 1, Window: Duration{Duration: time.Hour}, Key: "ip"}},
-		Routes:     []RouteConfig{{Name: "x", Pattern: "/x", Upstream: "http://u.example.test", Gatekeeper: GatekeeperConfig{MaxConcurrentCalls: 1}}},
+		Routes:     []RouteConfig{{Name: "x", Pattern: "/x", Upstream: newUpstream(t, okHandler), Gatekeeper: GatekeeperConfig{MaxConcurrentCalls: 1}}},
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer g.Close()
-	g.clients.Transport = roundTripFunc(okResponse)
 	for _, want := range []int{http.StatusOK, http.StatusTooManyRequests, http.StatusTooManyRequests} {
-		rr := httptest.NewRecorder()
-		g.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/x", nil))
-		if rr.Code != want {
-			t.Fatalf("got %d, want %d", rr.Code, want)
+		if got := serve(g, httptest.NewRequest(http.MethodGet, "/x", nil)).Code; got != want {
+			t.Fatalf("got %d, want %d", got, want)
 		}
 	}
 	if held := len(g.routes[0].gate.sem); held != 0 {
@@ -155,31 +160,20 @@ func TestRateLimitedRequestReleasesConcurrencySlot(t *testing.T) {
 }
 
 func TestRequestCancelledWhileQueuedReturnsAndReleasesSlots(t *testing.T) {
-	g, err := New(Config{Workers: 1, QueueSize: 1, Routes: []RouteConfig{{Name: "x", Pattern: "/x", Upstream: "http://u.example.test", Gatekeeper: GatekeeperConfig{MaxConcurrentCalls: 2}}}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer g.Close()
 	started, unblock := make(chan struct{}), make(chan struct{})
-	g.clients.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+	upstream := newUpstream(t, func(w http.ResponseWriter, _ *http.Request) {
 		close(started)
 		<-unblock
-		return okResponse(r)
 	})
+	g := newTestGateway(t, Config{Workers: 1, QueueSize: 1, Routes: []RouteConfig{{Name: "x", Pattern: "/x", Upstream: upstream, Gatekeeper: GatekeeperConfig{MaxConcurrentCalls: 2}}}})
 	first := make(chan struct{})
-	go func() {
-		g.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/x", nil))
-		close(first)
-	}()
+	go func() { serve(g, httptest.NewRequest(http.MethodGet, "/x", nil)); close(first) }()
 	<-started
 
 	// The only worker is busy, so this request waits in the queue until cancelled.
 	ctx, cancel := context.WithCancel(context.Background())
 	queued := make(chan struct{})
-	go func() {
-		g.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/x", nil).WithContext(ctx))
-		close(queued)
-	}()
+	go func() { serve(g, httptest.NewRequest(http.MethodGet, "/x", nil).WithContext(ctx)); close(queued) }()
 	cancel()
 	select {
 	case <-queued:
@@ -194,16 +188,39 @@ func TestRequestCancelledWhileQueuedReturnsAndReleasesSlots(t *testing.T) {
 }
 
 func TestFullQueueIsRejected(t *testing.T) {
-	g, err := New(Config{Workers: 1, QueueSize: 1, Routes: []RouteConfig{{Name: "x", Pattern: "/x", Upstream: "http://u.example.test"}}})
-	if err != nil {
-		t.Fatal(err)
+	g := newTestGateway(t, Config{Workers: 1, QueueSize: 1, Routes: []RouteConfig{{Name: "x", Pattern: "/x", Upstream: "http://u.example.test"}}})
+	g.admitted <- struct{}{}
+	g.admitted <- struct{}{}
+	if got := serve(g, httptest.NewRequest(http.MethodGet, "/x", nil)).Code; got != http.StatusServiceUnavailable {
+		t.Fatalf("got %d, want 503", got)
 	}
-	defer g.Close()
-	g.admitted <- struct{}{}
-	g.admitted <- struct{}{}
-	rr := httptest.NewRecorder()
-	g.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/x", nil))
-	if rr.Code != http.StatusServiceUnavailable {
-		t.Fatalf("got %d, want 503", rr.Code)
+}
+
+func TestUpstreamErrorsMapToStatus(t *testing.T) {
+	slow := newUpstream(t, func(w http.ResponseWriter, r *http.Request) { <-r.Context().Done() })
+	echo := newUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		buf := make([]byte, 1024)
+		for {
+			if _, err := r.Body.Read(buf); err != nil {
+				return
+			}
+		}
+	})
+	g := newTestGateway(t, Config{MaxBodyBytes: 8, Routes: []RouteConfig{
+		{Pattern: "/slow", Upstream: slow, Timeout: Duration{50 * time.Millisecond}},
+		{Pattern: "/echo", Upstream: echo},
+		{Pattern: "/down", Upstream: "http://127.0.0.1:1"},
+	}})
+	for _, tc := range []struct {
+		request *http.Request
+		want    int
+	}{
+		{httptest.NewRequest(http.MethodGet, "/slow", nil), http.StatusGatewayTimeout},
+		{httptest.NewRequest(http.MethodPost, "/echo", strings.NewReader(strings.Repeat("x", 64))), http.StatusRequestEntityTooLarge},
+		{httptest.NewRequest(http.MethodGet, "/down", nil), http.StatusBadGateway},
+	} {
+		if got := serve(g, tc.request).Code; got != tc.want {
+			t.Errorf("%s: got %d, want %d", tc.request.URL.Path, got, tc.want)
+		}
 	}
 }

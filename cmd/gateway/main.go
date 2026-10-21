@@ -36,7 +36,7 @@ func main() {
 	}
 	defer g.Close()
 
-	srv := &http.Server{Addr: cfg.Listen, Handler: g, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 60 * time.Second, IdleTimeout: 90 * time.Second}
+	srv := &http.Server{Addr: cfg.Listen, Handler: g, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: gateway.WriteTimeout, IdleTimeout: 90 * time.Second}
 	go func() {
 		log.Printf("gateway listening on %s", cfg.Listen)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
