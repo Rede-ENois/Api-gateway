@@ -41,9 +41,10 @@ offenders without trusting spoofed headers.
 `workers` caps concurrent upstream calls and `queue_size` caps how many more
 requests may wait for a worker. A request arriving with both full is rejected
 with `503` and counted in a warning logged at most once per second; a request
-whose client disconnects while waiting is dropped. Rate
-limits and the per-route concurrency cap answer `429` (with `Retry-After` for
-rate limits).
+whose client disconnects while waiting is dropped. The route timeout includes
+the time spent waiting for a worker; expiration while queued returns `504`.
+Rate limits and the per-route concurrency cap answer `429` (with `Retry-After`
+for rate limits).
 
 Upstream failures are logged and mapped to `413` (body above
 `max_body_bytes`), `504` (route `timeout`, default 30s) or `502`. A route

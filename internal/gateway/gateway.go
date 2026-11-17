@@ -159,14 +159,17 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "gateway overloaded", http.StatusServiceUnavailable)
 		return
 	}
+	ctx, cancel := context.WithTimeout(r.Context(), route.timeout)
+	defer cancel()
 	select {
 	case g.running <- struct{}{}:
 		defer func() { <-g.running }()
-	case <-r.Context().Done():
-		return // the client gave up while waiting for a worker
+	case <-ctx.Done():
+		if r.Context().Err() == nil {
+			http.Error(w, http.StatusText(http.StatusGatewayTimeout), http.StatusGatewayTimeout)
+		}
+		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), route.timeout)
-	defer cancel()
 	route.proxy.ServeHTTP(w, r.WithContext(ctx))
 }
 
