@@ -50,6 +50,10 @@ Upstream failures are logged and mapped to `413` (body above
 timeout must stay below the server write timeout (60s); the gateway refuses to
 start otherwise.
 
+Shutdown uses the longest effective route timeout (30s with no routes) plus
+one second to finish responses, capped at the 60s write timeout. Requests
+still waiting for a worker can outlast this drain window.
+
 ### Client IP behind a reverse proxy
 
 By default the client IP is the TCP peer address. When the gateway runs behind

@@ -112,6 +112,17 @@ func New(c Config) (*Gateway, error) {
 
 func (g *Gateway) Close() { g.transport.CloseIdleConnections() }
 
+func (g *Gateway) ShutdownTimeout() time.Duration {
+	var timeout time.Duration
+	for _, route := range g.routes {
+		timeout = max(timeout, route.timeout)
+	}
+	if timeout == 0 {
+		timeout = defaultRouteTimeout
+	}
+	return min(timeout+time.Second, WriteTimeout)
+}
+
 func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/healthz" {
 		w.WriteHeader(http.StatusOK)
