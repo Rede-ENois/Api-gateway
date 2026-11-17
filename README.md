@@ -90,7 +90,8 @@ To apply independent policies to several route trees, use the global
 ```
 
 Proxy routes stay under `routes`; they define the upstream, methods and the
-Gatekeeper. For example:
+Gatekeeper. Each upstream must be an absolute HTTP or HTTPS URL; an invalid
+upstream prevents the gateway from starting. For example:
 
 ```yaml
 routes:

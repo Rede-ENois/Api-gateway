@@ -146,6 +146,33 @@ func TestNewRejectsInvalidConfig(t *testing.T) {
 	}
 }
 
+func TestNewValidatesUpstreamScheme(t *testing.T) {
+	for _, tc := range []struct {
+		name, upstream, routeName, wantRoute string
+	}{
+		{"http", "http://u.example.test", "x", ""},
+		{"https", "https://u.example.test", "x", ""},
+		{"misspelled scheme", "htps://u.example.test", "x", `route "x"`},
+		{"unsupported scheme", "ftp://u.example.test", "", `route "/x"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g, err := New(Config{Routes: []RouteConfig{{Name: tc.routeName, Pattern: "/x", Upstream: tc.upstream}}})
+			if err == nil {
+				t.Cleanup(g.Close)
+			}
+			if tc.wantRoute == "" {
+				if err != nil {
+					t.Fatal(err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantRoute) || !strings.Contains(err.Error(), "upstream") {
+				t.Fatalf("got error %v, want upstream error for %s", err, tc.wantRoute)
+			}
+		})
+	}
+}
+
 func TestRateLimitedRequestReleasesConcurrencySlot(t *testing.T) {
 	g := newTestGateway(t, Config{
 		RateLimits: []RateLimitConfig{{Route: "/x", Pattern: "fixed_window", Limit: 1, Window: Duration{Duration: time.Hour}, Key: "ip"}},

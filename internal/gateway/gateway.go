@@ -71,6 +71,10 @@ func New(c Config) (*Gateway, error) {
 			g.Close()
 			return nil, fmt.Errorf("route %q: upstream must be an absolute URL", r.config.Name)
 		}
+		if target.Scheme != "http" && target.Scheme != "https" {
+			g.Close()
+			return nil, fmt.Errorf("route %q: upstream scheme must be http or https", r.config.Name)
+		}
 		timeout := rc.Timeout.Duration
 		if timeout <= 0 {
 			timeout = defaultRouteTimeout
